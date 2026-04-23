@@ -10,7 +10,9 @@ returns the response.
 
 import asyncio
 import base64
+import gzip
 import hashlib
+import http
 import json
 import logging
 import re
@@ -18,6 +20,7 @@ import socket
 import ssl
 import time
 from dataclasses import dataclass
+import urllib.parse
 from urllib.parse import urlparse
 
 import codec
@@ -429,6 +432,7 @@ class DomainFronter:
     def _exec_path_for_sid(self, sid: str) -> str:
         """Build the /macros/s/<sid>/(dev|exec) path for a specific script ID."""
         return f"/macros/s/{sid}/{'dev' if self._dev_available else 'exec'}"
+
     async def _flush_pool(self):
         """Close all pooled connections (they may be stale after errors)."""
         async with self._pool_lock:
@@ -490,7 +494,6 @@ class DomainFronter:
                     coros = [self._add_conn_to_pool()
                              for _ in range(min(needed, 5))]
                     await asyncio.gather(*coros, return_exceptions=True)
-
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -524,9 +527,7 @@ class DomainFronter:
         for task in list(self._bg_tasks):
             task.cancel()
         if self._bg_tasks:
-            self._spawn(self._prewarm_script())
-            if self._keepalive_task is None or self._keepalive_task.done():
-                self._keepalive_task = self._spawn
+            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
 
         await self._flush_pool()
 
@@ -631,7 +632,7 @@ class DomainFronter:
                 log.debug("Keepalive failed: %s", e)
 
     async def _do_warm(self):
-        """Open WARM_POOL_COUNTnnections in parallel — failures are fine."""
+        """Open WARM_POOL_COUNT connections in parallel — failures are fine."""
         count = 30
         coros = [self._add_conn_to_pool() for _ in range(count)]
         results = await asyncio.gather(*coros, return_exceptions=True)
@@ -641,10 +642,202 @@ class DomainFronter:
     def _auth_header(self) -> str:
         return f"X-Auth-Key: {self.auth_key}\r\n" if self.auth_key else ""
 
-    # ── Apps Script relay (apps_script mode) ──────────────────────
+    # ── Long-URL handling ─────────────────────────────────────────
 
-    async def relay(self, method: str, url: str,
-                    headers: dict, body: bytes = b"") -> bytes:
+    @staticmethod
+    def _try_split_long_param(url: str) -> list[str] | None:
+        """Split a long URL into multiple shorter ones by breaking a
+        comma-separated query param across chunks of ≤1950 chars.
+
+        Skips params whose value is a JSON object/array — those must go
+        through _convert_long_get_to_post instead.
+
+        Returns a list of URLs (len > 1) if a split is possible, else None.
+        """
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.query:
+            return None
+
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+        # Find params that are plain comma-separated lists (not JSON)
+        valid_keys = []
+        for k, v in params.items():
+            if not v or "," not in v[0]:
+                continue
+            val = v[0].strip()
+            if val.startswith(("{", "[")):
+                continue  # JSON param — caller handles this via POST
+            valid_keys.append(k)
+
+        if not valid_keys:
+            return None
+
+        # Pick the param with the most comma-separated values to split on
+        split_key = max(valid_keys, key=lambda k: len(params[k][0].split(",")))
+        all_values = params[split_key][0].split(",")
+        if len(all_values) <= 1:
+            return None
+
+        fixed_params = {k: v for k, v in params.items() if k != split_key}
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        fixed_qs = urllib.parse.urlencode(fixed_params, doseq=True)
+        sep = "&" if fixed_qs else ""
+        base_len = len(base_url) + 1 + len(fixed_qs) + len(sep) + len(split_key) + 1
+
+        urls: list[str] = []
+        current_group: list[str] = []
+        current_len = base_len
+
+        for val in all_values:
+            encoded_val = urllib.parse.quote(val, safe="")
+            segment_len = len(encoded_val) + 1  # +1 for comma
+            if current_len + segment_len > 1950 and current_group:
+                joined = urllib.parse.quote(",".join(current_group), safe=",")
+                urls.append(f"{base_url}?{fixed_qs}{sep}{split_key}={joined}")
+                current_group = [val]
+                current_len = base_len + len(encoded_val)
+            else:
+                current_group.append(val)
+                current_len += segment_len
+
+        if current_group:
+            joined = urllib.parse.quote(",".join(current_group), safe=",")
+            urls.append(f"{base_url}?{fixed_qs}{sep}{split_key}={joined}")
+
+        return urls if len(urls) > 1 else None
+
+    async def _fetch_and_stitch(
+        self, urls: list[str], headers: dict, req_origin: str = "*"
+    ) -> bytes:
+        """Fetch multiple URL chunks in parallel and concatenate their bodies.
+
+        Safe for JS, CSS, and binary responses where concatenation is
+        semantically correct. JSON responses cannot be safely stitched
+        (merging would corrupt paginated wrappers), so we return only the
+        first successful chunk and log a warning — still better than
+        corrupted merged data.
+        """
+        async def fetch_one(u: str) -> bytes:
+            payload = self._build_payload("GET", u, headers, b"")
+            return await self._batch_submit(payload)
+
+        responses = await asyncio.gather(
+            *[fetch_one(u) for u in urls], return_exceptions=True
+        )
+
+        content_type = b"application/octet-stream"
+        body_parts: list[bytes] = []
+        separator = b""
+
+        for resp in responses:
+            if isinstance(resp, Exception):
+                continue
+            status, hdrs, chunk_body = self._split_raw_response(resp)
+            if status != 200:
+                continue
+
+            if not body_parts:
+                ct = hdrs.get("content-type", "application/octet-stream").lower()
+                content_type = ct.encode()
+                if "json" in ct:
+                    # JSON cannot be naively concatenated or merged safely.
+                    # Return only this first chunk — partial data is less
+                    # harmful than silently corrupted merged data.
+                    log.warning(
+                        "_fetch_and_stitch: JSON response cannot be stitched "
+                        "safely; returning first chunk only"
+                    )
+                    return (
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: " + content_type + b"\r\n"
+                        b"Content-Length: " + str(len(chunk_body)).encode() + b"\r\n"
+                        b"Access-Control-Allow-Origin: " + req_origin.encode() + b"\r\n"
+                        b"Access-Control-Allow-Credentials: true\r\n"
+                        b"\r\n"
+                    ) + chunk_body
+                elif "javascript" in ct:
+                    separator = b"\n;\n"
+                elif "css" in ct:
+                    separator = b"\n"
+
+            body_parts.append(chunk_body)
+
+        if not body_parts:
+            return self._error_response(502, "All split requests failed", req_origin)
+
+        final_body = separator.join(body_parts)
+        return (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: " + content_type + b"\r\n"
+            b"Content-Length: " + str(len(final_body)).encode() + b"\r\n"
+            b"Cache-Control: public, max-age=31536000\r\n"
+            b"Access-Control-Allow-Origin: " + req_origin.encode() + b"\r\n"
+            b"Access-Control-Allow-Credentials: true\r\n"
+            b"\r\n"
+        ) + final_body
+
+    @staticmethod
+    def _has_json_params(url: str) -> bool:
+        """Return True if any query param value is a JSON object or array.
+
+        This is the universal signal that a GET request follows the GraphQL
+        over HTTP spec (section 6.1), which mandates that servers accept the
+        same query as either GET or POST. Converting these to POST is always
+        safe — it's the spec-defined fallback mechanism.
+
+        Plain REST APIs never have JSON-valued query params, so they will
+        never be converted and will receive a 414 from Apps Script instead,
+        which is the correct RFC 7231 response for an oversized URI.
+        """
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.query:
+            return False
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        return any(
+            v[0].strip().startswith(("{", "["))
+            for v in params.values() if v
+        )
+
+    def _convert_long_get_to_post(
+        self, url: str, headers: dict
+    ) -> tuple[str, dict, bytes]:
+        """Convert a GraphQL GET with JSON params into an equivalent POST.
+
+        Only called when _has_json_params() is True, so we know every
+        param value is valid JSON or a plain scalar mixed in with JSON ones.
+        The returned POST body is a JSON object mirroring the query string,
+        which is exactly what the GraphQL spec says servers must accept.
+        """
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        new_headers = dict(headers) if headers else {}
+
+        body_dict: dict = {}
+        for k, v in params.items():
+            raw_val = v[0] if len(v) == 1 else v
+            try:
+                body_dict[k] = json.loads(raw_val)
+            except (json.JSONDecodeError, TypeError):
+                body_dict[k] = raw_val
+
+        new_headers["Content-Type"] = "application/json"
+        new_body = json.dumps(body_dict).encode()
+        return base_url, new_headers, new_body
+
+    # ── Apps Script relay ─────────────────────────────────────────
+
+    @staticmethod
+    def _extract_origin(headers: dict | None) -> str:
+        if not headers:
+            return "*"
+        for k, v in headers.items():
+            if k.lower() == "origin":
+                return v
+        return "*"
+
+    async def relay(self, method: str, url: str, headers: dict, body: bytes = b"") -> bytes:
         """Relay an HTTP request through Apps Script.
 
         Features:
@@ -653,13 +846,64 @@ class DomainFronter:
           - Batches concurrent calls via fetchAll() (40ms window)
           - Retries once on connection failure
           - Concurrency-limited via semaphore
+          - Converts long GraphQL GETs to POST (spec-safe, structure-detected)
 
         Returns a raw HTTP response (status + headers + body).
         """
+        req_origin = self._extract_origin(headers)
+
+        # OPTIONS preflight — handle locally, no quota consumed.
+        if method == "OPTIONS":
+            req_cors_headers = "*"
+            if headers:
+                for k, v in headers.items():
+                    if k.lower() == "access-control-request-headers":
+                        req_cors_headers = v
+                        break
+            return (
+                f"HTTP/1.1 204 No Content\r\n"
+                f"Access-Control-Allow-Origin: {req_origin}\r\n"
+                f"Access-Control-Allow-Credentials: true\r\n"
+                f"Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n"
+                f"Access-Control-Allow-Headers: {req_cors_headers}\r\n"
+                f"Access-Control-Max-Age: 86400\r\n"
+                f"\r\n"
+            ).encode()
+
         if not self._warmed:
             await self._warm_pool()
 
+        # Long-URL handling for Apps Script's ~2048 char limit.
+        # Two strategies, tried in order:
+        #
+        # 1. GraphQL GET→POST (JSON-valued params): The GraphQL over HTTP spec
+        #    (section 6.1) requires servers to accept GET and POST equivalently
+        #    when params are JSON-valued. Safe for any conforming GraphQL API
+        #    with no domain allowlist needed.
+        #
+        # 2. Split & stitch (plain comma-separated params, e.g. Reddit's
+        #    /js/concat?chunks=a,b,c,...): Break the list across parallel
+        #    requests and concatenate the responses. Only safe for non-JSON
+        #    content (JS, CSS, binary) — JSON responses return first chunk only.
+        #
+        # If neither applies, the request passes through and Apps Script
+        # returns 414, which is the correct RFC 7231 response.
+        if method == "GET" and not body and len(url) > 1950:
+            if self._has_json_params(url):
+                url, headers, body = self._convert_long_get_to_post(url, headers)
+                method = "POST"
+                log.debug("Converted long GraphQL GET to POST: %s", url[:80])
+            else:
+                split_urls = self._try_split_long_param(url)
+                if split_urls:
+                    return await self._fetch_and_stitch(split_urls, headers, req_origin)
+                log.debug(
+                    "Long non-GraphQL URL, no splittable param, passing through "
+                    "(expect 414): %s", url[:80]
+                )
+
         payload = self._build_payload(method, url, headers, body)
+        has_range = headers and any(k.lower() == "range" for k in headers)
 
         t0 = time.perf_counter()
         errored = False
@@ -674,12 +918,6 @@ class DomainFronter:
             # Coalesce concurrent GETs for the same URL.
             # CRITICAL: do NOT coalesce when a Range header is present —
             # parallel range downloads MUST each hit the server independently.
-            has_range = False
-            if headers:
-                for k in headers:
-                    if k.lower() == "range":
-                        has_range = True
-                        break
             if method == "GET" and not body and not has_range:
                 result = await self._coalesced_submit(url, payload)
                 return result
@@ -761,9 +999,6 @@ class DomainFronter:
 
         status, resp_hdrs, resp_body = self._split_raw_response(first_resp)
 
-        # No range support → return the single response as-is (status 200
-        # from the origin). The client sent a plain GET, so 200 is what it
-        # expects.
         if status != 206:
             return first_resp
 
@@ -771,14 +1006,9 @@ class DomainFronter:
         content_range = resp_hdrs.get("content-range", "")
         m = re.search(r"/(\d+)", content_range)
         if not m:
-            # Can't parse — downgrade to 200 so the client (which sent a
-            # plain GET) doesn't get confused by 206 + Content-Range.
             return self._rewrite_206_to_200(first_resp)
         total_size = int(m.group(1))
 
-        # Small file: probe already fetched it all. MUST rewrite to 200
-        # because the client never sent a Range header — a stray 206 here
-        # breaks fetch()/XHR on sites like x.com and Cloudflare challenges.
         if total_size <= chunk_size or len(resp_body) >= total_size:
             return self._rewrite_206_to_200(first_resp)
 
@@ -798,21 +1028,19 @@ class DomainFronter:
 
         async def fetch_range(s, e, max_tries: int = 3):
             async with sem:
-                rh_base = dict(headers) if headers else {}
-                rh_base["Range"] = f"bytes={s}-{e}"
+                rh = dict(headers) if headers else {}
+                rh["Range"] = f"bytes={s}-{e}"
                 expected = e - s + 1
                 last_err = None
                 for attempt in range(max_tries):
                     try:
-                        raw = await self.relay("GET", url, rh_base, b"")
+                        raw = await self.relay("GET", url, rh, b"")
                         _, _, chunk_body = self._split_raw_response(raw)
                         if len(chunk_body) == expected:
                             return chunk_body
-                        last_err = (
-                            f"short chunk {len(chunk_body)}/{expected} B"
-                        )
-                    except Exception as e_:
-                        last_err = repr(e_)
+                        last_err = f"short chunk {len(chunk_body)}/{expected} B"
+                    except Exception as ex:
+                        last_err = repr(ex)
                     log.warning("Range %d-%d retry %d/%d: %s",
                                 s, e, attempt + 1, max_tries, last_err)
                     await asyncio.sleep(0.3 * (attempt + 1))
@@ -832,7 +1060,7 @@ class DomainFronter:
         for i, r in enumerate(results):
             if isinstance(r, Exception):
                 log.error("Range chunk %d failed: %s", i, r)
-                return self._error_response(502, f"Parallel download failed: {r}")
+                return self._error_response(502, f"Parallel download failed: {r}", req_origin=self._extract_origin(headers))
             parts.append(r)
 
         full_body = b"".join(parts)
@@ -841,9 +1069,9 @@ class DomainFronter:
                  len(full_body), elapsed, kbs)
 
         # Return as 200 OK (client sent a normal GET)
-        result = f"HTTP/1.1 200 OK\r\n"
         skip = {"transfer-encoding", "connection", "keep-alive",
                 "content-length", "content-encoding", "content-range"}
+        result = "HTTP/1.1 200 OK\r\n"
         for k, v in resp_hdrs.items():
             if k.lower() not in skip:
                 result += f"{k}: {v}\r\n"
@@ -868,12 +1096,10 @@ class DomainFronter:
         lines = header_section.decode(errors="replace").split("\r\n")
         if not lines:
             return raw
-        # Replace status line
         first = lines[0]
         if " 206" in first:
             lines[0] = first.replace(" 206 Partial Content", " 200 OK")\
                              .replace(" 206", " 200 OK")
-        # Drop Content-Range and recalculate Content-Length
         filtered = [lines[0]]
         for ln in lines[1:]:
             low = ln.lower()
@@ -898,10 +1124,11 @@ class DomainFronter:
             # but NOT brotli/zstd — forwarding "br" causes garbled responses.
             filt = {k: v for k, v in headers.items()
                     if k.lower() != "accept-encoding"}
+            filt["accept-encoding"] = "identity"
             payload["h"] = filt if filt else headers
         if body:
             payload["b"] = base64.b64encode(body).decode()
-            ct = headers.get("Content-Type") or headers.get("content-type")
+            ct = (headers or {}).get("Content-Type") or (headers or {}).get("content-type")
             if ct:
                 payload["ct"] = ct
         return payload
@@ -922,7 +1149,7 @@ class DomainFronter:
 
     @classmethod
     def _is_stateful_request(cls, method: str, url: str,
-                             headers: dict | None, body: bytes) -> bool:
+                              headers: dict | None, body: bytes) -> bool:
         method = method.upper()
         if method not in {"GET", "HEAD"} or body:
             return True
@@ -951,10 +1178,8 @@ class DomainFronter:
             return await self._relay_with_retry(payload)
 
         future = asyncio.get_event_loop().create_future()
-
         async with self._batch_lock:
             self._batch_pending.append((payload, future))
-
             if len(self._batch_pending) >= self._batch_max:
                 # Batch is full — flush now
                 batch = self._batch_pending[:]
@@ -1007,7 +1232,8 @@ class DomainFronter:
                     future.set_result(result)
             except Exception as e:
                 if not future.done():
-                    future.set_result(self._error_response(502, str(e)))
+                    req_origin = self._extract_origin(payload.get("h", {}))
+                    future.set_result(self._error_response(502, str(e), req_origin))
         else:
             log.info("Batch relay: %d requests", len(batch))
             try:
@@ -1020,12 +1246,10 @@ class DomainFronter:
                             "Redeploy Code.gs for batch support. Error: %s", e)
                 self._batch_enabled = False
                 # Fallback: send individually
-                tasks = []
-                for payload, future in batch:
-                    tasks.append(self._relay_fallback(payload, future))
+                tasks = [self._relay_fallback(p, f) for p, f in batch]
                 await asyncio.gather(*tasks)
 
-    async def _relay_fallback(self, payload, future):
+    async def _relay_fallback(self, payload: dict, future: asyncio.Future):
         """Fallback: relay a single request from a failed batch."""
         try:
             result = await self._relay_with_retry(payload)
@@ -1033,15 +1257,14 @@ class DomainFronter:
                 future.set_result(result)
         except Exception as e:
             if not future.done():
-                future.set_result(self._error_response(502, str(e)))
+                req_origin = self._extract_origin(payload.get("h", {}))
+                future.set_result(self._error_response(502, str(e), req_origin))
 
     # ── Core relay with retry ─────────────────────────────────────
 
     async def _relay_with_retry(self, payload: dict) -> bytes:
         """Single relay with one retry on failure. Uses H2 if available."""
         # Fan-out: race N Apps Script instances when enabled and H2 is up.
-        # Cuts tail latency when one container is slow/cold. Only kicks in
-        # if multiple script IDs are configured and the H2 transport is live.
         if (self._parallel_relay > 1
                 and len(self._script_ids) > 1
                 and self._h2 and self._h2.is_connected):
@@ -1051,7 +1274,6 @@ class DomainFronter:
                 )
             except Exception as e:
                 log.debug("Fan-out relay failed (%s), falling back", e)
-                # fall through to single-path logic below
 
         # Try HTTP/2 first — much faster (multiplexed, no pool checkout)
         if self._h2 and self._h2.is_connected:
@@ -1090,13 +1312,12 @@ class DomainFronter:
         """Fire the same relay against N distinct script IDs in parallel.
 
         Returns the first successful response; cancels the rest as soon as
-        one finishes. Any script that raises or loses the race AND later
-        fails individually is blacklisted for SCRIPT_BLACKLIST_TTL.
+        one finishes. Any script that raises gets blacklisted for
+        SCRIPT_BLACKLIST_TTL to stop a slow container poisoning tail latency.
         """
         host_key = self._host_key(payload.get("u"))
         sids = self._pick_fanout_sids(host_key)
         if len(sids) <= 1:
-            # Nothing to race against (e.g. all others blacklisted)
             return await self._relay_single_h2_with_sid(payload, sids[0])
 
         tasks = {
@@ -1105,7 +1326,6 @@ class DomainFronter:
             ): sid
             for sid in sids
         }
-        winner_result: bytes | None = None
         winner_exc: BaseException | None = None
         pending = set(tasks.keys())
         try:
@@ -1117,69 +1337,54 @@ class DomainFronter:
                     sid = tasks[t]
                     exc = t.exception()
                     if exc is None:
-                        winner_result = t.result()
-                        return winner_result
-                    # This racer failed — blacklist and keep waiting for others
+                        return t.result()
                     self._blacklist_sid(sid, reason=type(exc).__name__)
                     winner_exc = exc
-            # All racers failed
             if winner_exc is not None:
                 raise winner_exc
             raise RuntimeError("fan-out relay: all racers failed")
         finally:
             for t in pending:
                 t.cancel()
-            # Drain cancelled tasks so they don't log warnings
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
     async def _relay_single_h2(self, payload: dict) -> bytes:
-        """Execute a relay through HTTP/2 multiplexing.
-
-        Uses the shared H2 connection — no pool checkout needed.
-        Many concurrent calls all share one TLS connection.
-        """
+        """Execute a relay through HTTP/2 multiplexing."""
         full_payload = dict(payload)
         full_payload["k"] = self.auth_key
         json_body = json.dumps(full_payload).encode()
+        req_origin = self._extract_origin(payload.get("h", {}))
 
         path = self._exec_path(payload.get("u"))
-
         status, headers, body = await self._h2.request(
             method="POST", path=path, host=self.http_host,
             headers={"content-type": "application/json"},
             body=json_body,
         )
+        return self._parse_relay_response(body, req_origin)
 
-        return self._parse_relay_response(body)
-
-    async def _relay_single_h2_with_sid(self, payload: dict,
-                                        sid: str) -> bytes:
-        """Execute an H2 relay pinned to a specific Apps Script deployment.
-
-        Used by `_relay_fanout` to race multiple script IDs in parallel.
-        Mirrors `_relay_single_h2` but ignores the stable-hash routing.
-        """
+    async def _relay_single_h2_with_sid(self, payload: dict, sid: str) -> bytes:
+        """Execute an H2 relay pinned to a specific Apps Script deployment."""
         full_payload = dict(payload)
         full_payload["k"] = self.auth_key
         json_body = json.dumps(full_payload).encode()
+        req_origin = self._extract_origin(payload.get("h", {}))
 
         path = self._exec_path_for_sid(sid)
-
         status, headers, body = await self._h2.request(
             method="POST", path=path, host=self.http_host,
             headers={"content-type": "application/json"},
             body=json_body,
         )
-
-        return self._parse_relay_response(body)
+        return self._parse_relay_response(body, req_origin)
 
     async def _relay_single(self, payload: dict) -> bytes:
         """Execute a single relay POST → redirect → parse."""
-        # Add auth key
         full_payload = dict(payload)
         full_payload["k"] = self.auth_key
         json_body = json.dumps(full_payload).encode()
+        req_origin = self._extract_origin(payload.get("h", {}))
 
         path = self._exec_path(payload.get("u"))
         reader, writer, created = await self._acquire()
@@ -1206,7 +1411,6 @@ class DomainFronter:
                 location = resp_headers.get("location")
                 if not location:
                     break
-
                 parsed = urlparse(location)
                 rpath = parsed.path + ("?" + parsed.query if parsed.query else "")
                 if status in (307, 308):
@@ -1229,7 +1433,7 @@ class DomainFronter:
                 status, resp_headers, resp_body = await self._read_http_response(reader)
 
             await self._release(reader, writer, created)
-            return self._parse_relay_response(resp_body)
+            return self._parse_relay_response(resp_body, req_origin)
 
         except Exception:
             try:
@@ -1240,10 +1444,7 @@ class DomainFronter:
 
     async def _relay_batch(self, payloads: list[dict]) -> list[bytes]:
         """Send multiple requests in one POST using Apps Script fetchAll."""
-        batch_payload = {
-            "k": self.auth_key,
-            "q": payloads,
-        }
+        batch_payload = {"k": self.auth_key, "q": payloads}
         json_body = json.dumps(batch_payload).encode()
         path = self._exec_path(payloads[0].get("u") if payloads else None)
 
@@ -1309,7 +1510,6 @@ class DomainFronter:
                     status, resp_headers, resp_body = await self._read_http_response(reader)
 
                 await self._release(reader, writer, created)
-
             except Exception:
                 try:
                     writer.close()
@@ -1319,9 +1519,8 @@ class DomainFronter:
 
         return self._parse_batch_body(resp_body, payloads)
 
-    def _parse_batch_body(self, resp_body: bytes,
-                          payloads: list[dict]) -> list[bytes]:
-        """Parse a batch response body into individual results."""
+    def _parse_batch_body(self, resp_body: bytes, payloads: list[dict]) -> list[bytes]:
+        """Parse a batch response body into individual raw HTTP responses."""
         text = resp_body.decode(errors="replace").strip()
         try:
             data = json.loads(text)
@@ -1333,7 +1532,6 @@ class DomainFronter:
                 data = None
         if not data:
             raise RuntimeError(f"Bad batch response: {text[:200]}")
-
         if "e" in data:
             raise RuntimeError(f"Batch error: {data['e']}")
 
@@ -1344,11 +1542,12 @@ class DomainFronter:
             )
 
         results = []
-        for item in items:
-            results.append(self._parse_relay_json(item))
+        for item, payload in zip(items, payloads):
+            req_origin = self._extract_origin(payload.get("h", {}))
+            results.append(self._parse_relay_json(item, req_origin))
         return results
 
-    # ── HTTP response reading (keep-alive safe) ──────────────────
+    # ── HTTP response reading (keep-alive safe) ───────────────────
 
     async def _read_http_response(self, reader: asyncio.StreamReader):
         """Read one HTTP response. Keep-alive safe (no read-until-EOF)."""
@@ -1367,8 +1566,7 @@ class DomainFronter:
         header_section, body = raw.split(b"\r\n\r\n", 1)
         lines = header_section.split(b"\r\n")
 
-        status_line = lines[0].decode(errors="replace")
-        m = re.search(r"\d{3}", status_line)
+        m = re.search(r"\d{3}", lines[0].decode(errors="replace"))
         status = int(m.group()) if m else 0
 
         headers = {}
@@ -1377,21 +1575,25 @@ class DomainFronter:
                 k, v = line.decode(errors="replace").split(":", 1)
                 headers[k.strip().lower()] = v.strip()
 
-        content_length = headers.get("content-length")
         transfer_encoding = headers.get("transfer-encoding", "")
+        content_length = headers.get("content-length")
 
         if "chunked" in transfer_encoding:
             body = await self._read_chunked(reader, body)
         elif content_length:
-            remaining = int(content_length) - len(body)
-            while remaining > 0:
-                chunk = await asyncio.wait_for(
-                    reader.read(min(remaining, 65536)), timeout=20
-                )
-                if not chunk:
-                    break
-                body += chunk
-                remaining -= len(chunk)
+            target = int(content_length)
+            if len(body) > target:
+                body = body[:target]
+            else:
+                remaining = target - len(body)
+                while remaining > 0:
+                    chunk = await asyncio.wait_for(
+                        reader.read(min(remaining, 65536)), timeout=20
+                    )
+                    if not chunk:
+                        break
+                    body += chunk
+                    remaining -= len(chunk)
         else:
             # No framing — short timeout read (keep-alive safe)
             while True:
@@ -1410,7 +1612,7 @@ class DomainFronter:
 
         return status, headers, body
 
-    async def _read_chunked(self, reader, buf=b""):
+    async def _read_chunked(self, reader: asyncio.StreamReader, buf: bytes = b"") -> bytes:
         """Incrementally read chunked transfer-encoding."""
         result = b""
         _MAX_BODY = 200 * 1024 * 1024  # 200 MB total body cap
@@ -1422,7 +1624,7 @@ class DomainFronter:
                 buf += data
 
             end = buf.find(b"\r\n")
-            size_str = buf[:end].decode(errors="replace").strip()
+            size_str = buf[:end].split(b";", 1)[0].decode(errors="replace").strip()
             buf = buf[end + 2:]
 
             if not size_str:
@@ -1431,13 +1633,25 @@ class DomainFronter:
                 size = int(size_str, 16)
             except ValueError:
                 break
+
             if size == 0:
-                break
-            if size > _MAX_BODY or len(result) + size > _MAX_BODY:
-                log.warning("Chunked body exceeds %d MB cap — truncating", _MAX_BODY // (1024 * 1024))
+                # Drain optional trailers
+                while b"\r\n\r\n" not in buf and buf != b"\r\n":
+                    try:
+                        data = await asyncio.wait_for(reader.read(8192), timeout=2)
+                        if not data:
+                            break
+                        buf += data
+                    except asyncio.TimeoutError:
+                        break
                 break
 
-            while len(buf) < size + 2:
+            if size > _MAX_BODY or len(result) + size > _MAX_BODY:
+                log.warning("Chunked body exceeds %d MB cap — truncating",
+                            _MAX_BODY // (1024 * 1024))
+                break
+
+            while len(buf) < size:
                 data = await asyncio.wait_for(reader.read(65536), timeout=20)
                 if not data:
                     result += buf[:size]
@@ -1445,57 +1659,61 @@ class DomainFronter:
                 buf += data
 
             result += buf[:size]
-            buf = buf[size + 2:]
+            buf = buf[size:]
+
+            # Consume trailing CRLF after chunk data
+            while len(buf) < 2:
+                data = await asyncio.wait_for(reader.read(8192), timeout=20)
+                if not data:
+                    return result
+                buf += data
+            buf = buf[2:]
 
         return result
 
     # ── Response parsing ──────────────────────────────────────────
 
-    def _parse_relay_response(self, body: bytes) -> bytes:
+    def _parse_relay_response(self, body: bytes, req_origin: str = "*") -> bytes:
         """Parse JSON from Apps Script and reconstruct an HTTP response."""
         text = body.decode(errors="replace").strip()
         if not text:
-            return self._error_response(502, "Empty response from relay")
-
+            return self._error_response(502, "Empty response from relay", req_origin)
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            m = re.search(r'\{.*\}', text, re.DOTALL)
+            m = re.search(r"\{.*\}", text, re.DOTALL)
             if m:
                 try:
                     data = json.loads(m.group())
                 except json.JSONDecodeError:
-                    return self._error_response(502, f"Bad JSON: {text[:200]}")
+                    return self._error_response(502, f"Bad JSON: {text[:200]}", req_origin)
             else:
-                return self._error_response(502, f"No JSON: {text[:200]}")
+                return self._error_response(502, f"No JSON: {text[:200]}", req_origin)
+        return self._parse_relay_json(data, req_origin)
 
-        return self._parse_relay_json(data)
-
-    def _parse_relay_json(self, data: dict) -> bytes:
+    def _parse_relay_json(self, data: dict, req_origin: str = "*") -> bytes:
         """Convert a parsed relay JSON dict to raw HTTP response bytes."""
         if "e" in data:
-            return self._error_response(502, f"Relay error: {data['e']}")
+            return self._error_response(502, f"Relay error: {data['e']}", req_origin)
 
         status = data.get("s", 200)
         resp_headers = data.get("h", {})
         resp_body = base64.b64decode(data.get("b", ""))
 
-        status_text = {200: "OK", 206: "Partial Content",
-                       301: "Moved", 302: "Found", 304: "Not Modified",
-                       400: "Bad Request", 403: "Forbidden", 404: "Not Found",
-                       500: "Internal Server Error"}.get(status, "OK")
-        result = f"HTTP/1.1 {status} {status_text}\r\n"
+        try:
+            status_text = http.HTTPStatus(status).phrase
+        except ValueError:
+            status_text = "Unknown"
 
-        skip = {"transfer-encoding", "connection", "keep-alive",
-                "content-length", "content-encoding"}
+        skip = {
+            "transfer-encoding", "connection", "keep-alive",
+            "content-length", "content-encoding",
+            "access-control-allow-origin", "access-control-allow-credentials",
+        }
+        result = f"HTTP/1.1 {status} {status_text}\r\n"
         for k, v in resp_headers.items():
             if k.lower() in skip:
                 continue
-            # Apps Script returns multi-valued headers (e.g. Set-Cookie) as a
-            # JavaScript array. Emit each value as its own header line.
-            # A single string that holds multiple Set-Cookie values joined
-            # with ", " also needs to be split, otherwise the browser sees
-            # one malformed cookie and sites like x.com fail.
             values = v if isinstance(v, list) else [v]
             if k.lower() == "set-cookie":
                 expanded = []
@@ -1504,6 +1722,9 @@ class DomainFronter:
                 values = expanded
             for val in values:
                 result += f"{k}: {val}\r\n"
+
+        result += f"Access-Control-Allow-Origin: {req_origin}\r\n"
+        result += f"Access-Control-Allow-Credentials: true\r\n"
         result += f"Content-Length: {len(resp_body)}\r\n"
         result += "\r\n"
         return result.encode() + resp_body
@@ -1520,8 +1741,6 @@ class DomainFronter:
         """
         if not blob:
             return []
-        # Split on ", " but only when the following text looks like the start
-        # of a new cookie (a token followed by '=').
         parts = re.split(r",\s*(?=[A-Za-z0-9!#$%&'*+\-.^_`|~]+=)", blob)
         return [p.strip() for p in parts if p.strip()]
 
@@ -1540,12 +1759,18 @@ class DomainFronter:
                 headers[k.strip().lower()] = v.strip()
         return status, headers, body
 
-    def _error_response(self, status: int, message: str) -> bytes:
+    def _error_response(self, status: int, message: str, req_origin: str = "*") -> bytes:
         body = f"<html><body><h1>{status}</h1><p>{message}</p></body></html>"
+        try:
+            status_text = http.HTTPStatus(status).phrase
+        except ValueError:
+            status_text = "Error"
         return (
-            f"HTTP/1.1 {status} Error\r\n"
+            f"HTTP/1.1 {status} {status_text}\r\n"
             f"Content-Type: text/html\r\n"
             f"Content-Length: {len(body)}\r\n"
+            f"Access-Control-Allow-Origin: {req_origin}\r\n"
+            f"Access-Control-Allow-Credentials: true\r\n"
             f"\r\n"
             f"{body}"
         ).encode()
